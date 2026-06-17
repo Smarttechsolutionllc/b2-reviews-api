@@ -9,14 +9,15 @@ Endpoints
   POST /api/reviews                   submit a review (multipart form, optional photos)
   GET  /admin                         moderation UI (paste admin token)
   GET  /api/admin/pending             pending reviews (token)
+  GET  /api/admin/test-email          send a SendGrid test email (token)
   POST /api/admin/reviews/<id>/approve
   POST /api/admin/reviews/<id>/reject
 
 All configuration comes from environment variables - see .env.example.
 """
+import html
 import os
 import uuid
-import html
 from datetime import datetime
 
 from flask import Flask, request, jsonify, abort, Response
@@ -158,15 +159,53 @@ def verify_purchase(email, product_id):
     return False
 
 
+def send_email_via_sendgrid(subject, plain_text, html_body=None):
+    """Send an email through SendGrid. Returns (ok, status, body)."""
+    missing = [
+        name for name, value in {
+            "SENDGRID_API_KEY": SENDGRID_API_KEY,
+            "SENDGRID_FROM_EMAIL": SENDGRID_FROM_EMAIL,
+            "REVIEW_NOTIFY_EMAIL": REVIEW_NOTIFY_EMAIL,
+        }.items()
+        if not value
+    ]
+    if missing:
+        return False, "missing_env", ", ".join(missing)
+
+    payload = {
+        "personalizations": [
+            {
+                "to": [{"email": REVIEW_NOTIFY_EMAIL}],
+                "subject": subject,
+            }
+        ],
+        "from": {"email": SENDGRID_FROM_EMAIL, "name": "B Squared Reviews"},
+        "content": [{"type": "text/plain", "value": plain_text}],
+    }
+    if html_body:
+        payload["content"].append({"type": "text/html", "value": html_body})
+
+    try:
+        response = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=10,
+        )
+        ok = response.status_code in (200, 202)
+        return ok, response.status_code, response.text[:500]
+    except requests.RequestException as exc:
+        return False, "request_exception", str(exc)
+
+
 def send_pending_review_email(review):
     """Notify the business owner that a review is waiting for moderation.
 
     Notification failures are logged but do not block review submission.
     """
-    if not (SENDGRID_API_KEY and SENDGRID_FROM_EMAIL and REVIEW_NOTIFY_EMAIL):
-        app.logger.info("SendGrid notification skipped: missing email environment variables.")
-        return
-
     stars = "★" * int(review.rating) + "☆" * (5 - int(review.rating))
     product = review.product_title or review.product_id or "Not specified"
     verified_text = "Yes" if review.verified else "No"
@@ -213,39 +252,13 @@ Moderate it here:
     </div>
     """
 
-    payload = {
-        "personalizations": [
-            {
-                "to": [{"email": REVIEW_NOTIFY_EMAIL}],
-                "subject": "New B Squared review pending approval",
-            }
-        ],
-        "from": {"email": SENDGRID_FROM_EMAIL, "name": "B Squared Reviews"},
-        "content": [
-            {"type": "text/plain", "value": plain_text},
-            {"type": "text/html", "value": html_body},
-        ],
-    }
-
-    try:
-        response = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers={
-                "Authorization": f"Bearer {SENDGRID_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=10,
-        )
-        if response.status_code not in (200, 202):
-            app.logger.warning(
-                "SendGrid notification failed: status=%s body=%s",
-                response.status_code,
-                response.text[:500],
-            )
-    except requests.RequestException as exc:
-        app.logger.warning("SendGrid notification failed: %s", exc)
-
+    ok, status, body = send_email_via_sendgrid(
+        "New B Squared review pending approval",
+        plain_text,
+        html_body,
+    )
+    if not ok:
+        app.logger.warning("SendGrid notification failed: status=%s body=%s", status, body)
 
 
 def require_admin():
@@ -322,6 +335,31 @@ def admin_pending():
     require_admin()
     rows = Review.query.filter_by(approved=False).order_by(Review.created_at.asc()).all()
     return jsonify([{**r.public(), "email": r.email} for r in rows])
+
+
+@app.get("/api/admin/test-email")
+def admin_test_email():
+    require_admin()
+    subject = "B Squared review notification test"
+    plain_text = f"""This is a test email from the B Squared Reviews API.
+
+If you received this, SendGrid is connected correctly.
+
+Moderation panel:
+{REVIEW_ADMIN_URL}
+"""
+    html_body = f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.55;color:#111827">
+      <h2 style="margin:0 0 12px">B Squared review notification test</h2>
+      <p>If you received this, SendGrid is connected correctly.</p>
+      <p><a href="{html.escape(REVIEW_ADMIN_URL)}">Open moderation panel</a></p>
+    </div>
+    """
+    ok, status, body = send_email_via_sendgrid(subject, plain_text, html_body)
+    if not ok:
+        app.logger.warning("SendGrid test email failed: status=%s body=%s", status, body)
+        return jsonify({"ok": False, "status": status, "body": body}), 500
+    return jsonify({"ok": True, "message": f"Test email sent to {REVIEW_NOTIFY_EMAIL}."})
 
 
 @app.post("/api/admin/reviews/<int:rid>/approve")
